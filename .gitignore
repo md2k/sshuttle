@@ -18,3 +18,4 @@
 /.direnv/
 /result
 /.vscode/
+**.idea**
