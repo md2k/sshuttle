@@ -535,15 +535,15 @@ def ondns(listener, method, mux, handlers, **kwargs):
 
     debug3("DNS Request for: %s"% (dnsutils.decode_dns_message(data)["questions"][0]["domain_name_string"]))
 
-    match=True # temporary for development and debug, we will try bypass only domains in dns_domains
+    match=False
     if kwargs["dns_domains"] is not None:
         for domain in kwargs["dns_domains"]:
             if dnsutils.match_q_domain(dnsutils.decode_dns_message(data)["questions"], domain):
-                match=False
+                match=True
                 break
 
     if match:
-        debug2("DNS Request routed to tunnel for: %s"% (dnsutils.decode_dns_message(data)["questions"][0]["domain_name_string"]))
+        debug1("DNS Request routed to tunnel for: %s"% (dnsutils.decode_dns_message(data)["questions"][0]["domain_name_string"]))
         chan = mux.next_channel()
         dnsreqs[chan] = now + 30
         mux.send(chan, ssnet.CMD_DNS_REQ, data)
