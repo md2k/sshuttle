@@ -102,6 +102,8 @@ def main():
                                       opt.latency_control,
                                       opt.latency_buffer_size,
                                       opt.dns,
+                                      opt.dns_domains,
+                                      opt.dns_to,
                                       nslist,
                                       opt.method,
                                       sh,

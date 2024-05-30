@@ -6,6 +6,7 @@ import subprocess as ssubprocess
 import os
 import sys
 import platform
+import struct
 
 import sshuttle.helpers as helpers
 import sshuttle.ssnet as ssnet
@@ -27,6 +28,8 @@ except ImportError:
     getgrnam = None
 
 import socket
+import sshuttle.dnsutils as dnsutils
+import pprint
 
 _extra_fd = os.open(os.devnull, os.O_RDONLY)
 
@@ -133,7 +136,7 @@ class MultiListener:
         if self.v4:
             self.v4.setsockopt(level, optname, value)
 
-    def add_handler(self, handlers, callback, method, mux):
+    def add_handler(self, handlers, callback, method, mux, **kwargs):
         assert self.bind_called
         socks = []
         if self.v6:
@@ -144,7 +147,7 @@ class MultiListener:
         handlers.append(
             Handler(
                 socks,
-                lambda sock: callback(sock, method, mux, handlers)
+                lambda sock: callback(sock, method, mux, handlers, **kwargs)
             )
         )
 
@@ -417,6 +420,7 @@ class FirewallClient:
 
 dnsreqs = {}
 udp_by_src = {}
+dnsforwards = {}
 
 
 def expire_connections(now, mux):
@@ -515,7 +519,7 @@ def dns_done(chan, data, method, sock, srcip, dstip, mux):
     method.send_udp(sock, srcip, dstip, data)
 
 
-def ondns(listener, method, mux, handlers):
+def ondns(listener, method, mux, handlers, **kwargs):
     now = time.time()
     t = method.recv_udp(listener, 4096)
     if t is None:
@@ -528,17 +532,35 @@ def ondns(listener, method, mux, handlers):
     else:
         debug1('DNS request from %r to %r: %d bytes' %
                (srcip, dstip, len(data)))
-    chan = mux.next_channel()
-    dnsreqs[chan] = now + 30
-    mux.send(chan, ssnet.CMD_DNS_REQ, data)
-    mux.channels[chan] = lambda cmd, data: dns_done(
-        chan, data, method, listener, srcip=dstip, dstip=srcip, mux=mux)
-    expire_connections(now, mux)
 
+    debug3("DNS Request for: %s"% (dnsutils.decode_dns_message(data)["questions"][0]["domain_name_string"]))
+
+    match=True # temporary for development and debug, we will try bypass only domains in dns_domains
+    if kwargs["dns_domains"] is not None:
+        for domain in kwargs["dns_domains"]:
+            if dnsutils.match_q_domain(dnsutils.decode_dns_message(data)["questions"], domain):
+                match=False
+                break
+
+    if match:
+        debug2("DNS Request routed to tunnel for: %s"% (dnsutils.decode_dns_message(data)["questions"][0]["domain_name_string"]))
+        chan = mux.next_channel()
+        dnsreqs[chan] = now + 30
+        mux.send(chan, ssnet.CMD_DNS_REQ, data)
+        mux.channels[chan] = lambda cmd, data: dns_done(
+            chan, data, method, listener, srcip=dstip, dstip=srcip, mux=mux)
+        expire_connections(now, mux)
+    else:
+        debug2("DNS Request sent to local defined server: %s"% (dnsutils.decode_dns_message(data)["questions"][0]["domain_name_string"]))
+        kwargs["dns_forwarder"].sendto(data, (kwargs["dns_to"][1],kwargs["dns_to"][2]))
+        dnsforwards[dnsutils.decode_dns_message(data)["id"]] = srcip,now + 30
+        for item, (peer, timeout) in dnsforwards.items():
+            if timeout < now:
+                del dnsforwards[item]
 
 def _main(tcp_listener, udp_listener, fw, ssh_cmd, remotename,
           python, latency_control, latency_buffer_size,
-          dns_listener, seed_hosts, auto_hosts, auto_nets, daemon,
+          dns_listener, dns_forwarder, dns_domains, dns_to, seed_hosts, auto_hosts, auto_nets, daemon,
           to_nameserver):
 
     helpers.logprefix = 'c : '
@@ -720,7 +742,29 @@ def _main(tcp_listener, udp_listener, fw, ssh_cmd, remotename,
         udp_listener.add_handler(handlers, onaccept_udp, method, mux)
 
     if dns_listener:
-        dns_listener.add_handler(handlers, ondns, method, mux)
+        dns_listener.add_handler(handlers, ondns, method, mux, dns_domains=dns_domains, dns_to=dns_to, dns_forwarder=dns_forwarder)
+
+    # TODO: need to rewrite
+    # NOTE: `peer` is srcip , from where request to DNS was originated
+    def ondnsforward(socket):
+        debug2("We got a response.\n")
+        pkt,server = dns_forwarder.recvfrom(4096)
+        # now = time.time()
+        if server[0] != dns_to[1] or server[1] != dns_to[2]:
+            # check if IP and Port does not match
+            debug2("Ooops. The response came from the wrong server. Ignoring\n")
+        else:
+            dns = dnsutils.decode_dns_message(pkt)
+            chan=dns["id"]
+            peer, timeout = dnsforwards.get(chan) or (None,None)
+            debug2('dns_done: channel=%r to peer=%r\n' % (chan, peer))
+            if peer:
+                del dnsforwards[chan]
+                debug2('doing sendto %r\n' % (peer,))
+                dns_listener.v4.sendto(pkt, peer)
+
+    if dns_forwarder:
+        handlers.append(Handler([dns_forwarder], ondnsforward))
 
     if seed_hosts is not None:
         debug1('seed_hosts: %r' % seed_hosts)
@@ -752,7 +796,7 @@ def _main(tcp_listener, udp_listener, fw, ssh_cmd, remotename,
 
 def main(listenip_v6, listenip_v4,
          ssh_cmd, remotename, python, latency_control,
-         latency_buffer_size, dns, nslist,
+         latency_buffer_size, dns, dns_domains, dns_to, nslist,
          method_name, seed_hosts, auto_hosts, auto_nets,
          subnets_include, subnets_exclude, daemon, to_nameserver, pidfile,
          user, group, sudo_pythonpath, tmark):
@@ -1020,6 +1064,11 @@ def main(listenip_v6, listenip_v4,
 
     bound = False
     if required.dns:
+
+        dns_forwarder = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        dns_forwarder.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        dns_forwarder.setsockopt(socket.SOL_IP, socket.IP_TTL, 42)
+
         # search for spare port for DNS
         ports = range(12300, 9000, -1)
         for port in ports:
@@ -1063,6 +1112,7 @@ def main(listenip_v6, listenip_v4,
         dnsport_v6 = 0
         dnsport_v4 = 0
         dns_listener = None
+        dns_forwarder = None
 
     # Last minute sanity checks.
     # These should never fail.
@@ -1102,7 +1152,7 @@ def main(listenip_v6, listenip_v4,
     try:
         return _main(tcp_listener, udp_listener, fw, ssh_cmd, remotename,
                      python, latency_control, latency_buffer_size,
-                     dns_listener, seed_hosts, auto_hosts, auto_nets,
+                     dns_listener, dns_forwarder, dns_domains, dns_to, seed_hosts, auto_hosts, auto_nets,
                      daemon, to_nameserver)
     finally:
         try:

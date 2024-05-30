@@ -214,6 +214,27 @@ parser.add_argument(
     capture local DNS requests and forward to the remote DNS server
     """
 )
+
+parser.add_argument(
+    "--dns-domains",
+    metavar="pattern[,pattern]",
+    action="append",
+    default=[],
+    type=parse_list,
+    help="""
+    list of patterns to match DNS requests against requested domains to forward them to sshuttle if --dns is set
+    """
+)
+
+parser.add_argument(
+    "--dns-to",
+    metavar="IP:PORT",
+    type=parse_ipport,
+    help="""
+    DNS server to forward DNS requests which are not matched by --dns_domains
+    """
+)
+
 parser.add_argument(
     "--ns-hosts",
     metavar="IP[,IP]",
