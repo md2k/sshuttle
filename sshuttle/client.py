@@ -554,7 +554,7 @@ def ondns(listener, method, mux, handlers, **kwargs):
         debug2("DNS Request sent to local defined server: %s"% (dnsutils.decode_dns_message(data)["questions"][0]["domain_name_string"]))
         kwargs["dns_forwarder"].sendto(data, (kwargs["dns_to"][1],kwargs["dns_to"][2]))
         dnsforwards[dnsutils.decode_dns_message(data)["id"]] = srcip,now + 30
-        for item, (peer, timeout) in dnsforwards.items():
+        for item, (peer, timeout) in dnsforwards.copy().items():
             if timeout < now:
                 del dnsforwards[item]
 
